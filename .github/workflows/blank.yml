@@ -1,0 +1,109 @@
+name: Build Android APK (URL mode)
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: 'Job ID from bot'
+        required: true
+        type: string
+      userId:
+        description: 'Telegram user ID'
+        required: true
+        type: string
+      payload:
+        description: 'JSON payload from bot'
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout worker repo
+        uses: actions/checkout@v4
+
+      - name: Parse payload
+        id: meta
+        run: |
+          echo '${{ inputs.payload }}' > /tmp/payload.json
+          APP_NAME=$(python3 -c "import json; d=json.load(open('/tmp/payload.json')); print(d.get('appName','My App'))")
+          TARGET_URL=$(python3 -c "import json; d=json.load(open('/tmp/payload.json')); print(d.get('url','') or d.get('targetUrl',''))")
+          echo "app_name=$APP_NAME" >> $GITHUB_OUTPUT
+          echo "target_url=$TARGET_URL" >> $GITHUB_OUTPUT
+          echo "App: $APP_NAME | URL: $TARGET_URL"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Unzip template & prepare project
+        run: |
+          set -e
+
+          # Cari file zip di folder template
+          ZIP_FILE=$(find template -name "android-native-template*.zip" | head -1)
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: template zip tidak ditemukan di folder template/"
+            ls -la template/ || true
+            exit 1
+          fi
+          echo "Found zip: $ZIP_FILE"
+
+          # Unzip
+          mkdir -p /tmp/tpl
+          unzip -q "$ZIP_FILE" -d /tmp/tpl
+          echo "Isi hasil unzip:"
+          ls -la /tmp/tpl
+
+          # Ambil folder project (hasil unzip biasanya android-native-template/)
+          SRC=$(find /tmp/tpl -maxdepth 2 -type d -name "app" | head -1)
+          if [ -n "$SRC" ]; then
+            SRC=$(dirname "$SRC")
+          else
+            SRC=$(find /tmp/tpl -mindepth 1 -maxdepth 1 -type d | head -1)
+          fi
+          echo "Source project: $SRC"
+          cp -r "$SRC" project
+          cd project
+          ls -la
+
+          # Inject nama aplikasi
+          APP_NAME='${{ steps.meta.outputs.app_name }}'
+          if [ -f app/src/main/res/values/strings.xml ]; then
+            sed -i "s|<string name=\"app_name\">.*</string>|<string name=\"app_name\">${APP_NAME}</string>|" app/src/main/res/values/strings.xml
+          fi
+
+          # Inject URL (Base64)
+          TARGET_URL='${{ steps.meta.outputs.target_url }}'
+          ENCODED=$(echo -n "$TARGET_URL" | base64 -w 0)
+          find . \( -name "*.java" -o -name "*.kt" \) -print0 | xargs -0 sed -i "s|ENCODED_URL_PLACEHOLDER|${ENCODED}|g"
+
+          chmod +x gradlew || true
+          echo "Project siap dibuild"
+
+      - name: Build Release APK
+        working-directory: project
+        run: |
+          ./gradlew assembleRelease --no-daemon --stacktrace
+          mkdir -p /tmp/out
+          find . -name "*.apk" -path "*/release/*" -exec cp {} /tmp/out/app-release.apk \;
+          ls -lah /tmp/out/
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: /tmp/out/*.apk
+          retention-days: 1
+          if-no-files-found: error
