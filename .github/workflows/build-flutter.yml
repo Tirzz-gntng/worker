@@ -209,11 +209,19 @@ jobs:
 
           # b) Batas atas Dart SDK < 3.0.0 → project era Dart 2 → Flutter 3.7.x
           if [ -z "$FLUTTER_VER" ]; then
-            UPPER=$(grep -A4 '^environment:' pubspec.yaml | grep -E '^\s+sdk:' | head -1 | grep -oE '<\s*[0-9]+' | grep -oE '[0-9]+' || true)
-            if [ -n "$UPPER" ] && [ "$UPPER" -le 2 ] 2>/dev/null; then
-              FLUTTER_VER="3.7.12"
-              echo "pubspec membatasi Dart <3 → pakai Flutter $FLUTTER_VER"
-            fi
+            FLUTTER_VER=$(node -e "
+              const t=require('fs').readFileSync('pubspec.yaml','utf8');
+              const env=(t.match(/^environment:\\s*\\n((?:[ \\t]+.*\\n?)*)/m)||[])[1]||'';
+              const sdk=((env.match(/^[ \\t]+sdk:\\s*(.+)\$/m)||[])[1]||'').replace(/[\\\"']/g,'');
+              let upper=null;
+              const lt=sdk.match(/<\\s*(\\d+)/);
+              const caret=sdk.match(/\\^\\s*(\\d+)\\./);
+              if(lt) upper=parseInt(lt[1],10);
+              else if(caret) upper=parseInt(caret[1],10)+1;
+              console.log(upper!==null && upper<=3 ? '3.7.12' : '');
+            ")
+            echo "Dart sdk constraint di pubspec: $(grep -E '^\s+sdk:' pubspec.yaml | head -1)"
+            [ -n "$FLUTTER_VER" ] && echo "Dart 2.x terdeteksi → pakai Flutter $FLUTTER_VER"
           fi
 
           if [ -n "$FLUTTER_VER" ]; then
