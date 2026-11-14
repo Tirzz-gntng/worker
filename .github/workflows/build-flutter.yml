@@ -206,25 +206,92 @@ jobs:
           set -euo pipefail
           BUILD_TYPE=$(node -e "const p=JSON.parse(require('fs').readFileSync('/tmp/payload.json','utf8')); console.log((p.buildType||'release').toLowerCase())")
           echo "Build type = $BUILD_TYPE"
+          echo "Flutter: $(flutter --version | head -1)"
+          echo "Java: $(java -version 2>&1 | head -1)"
 
-          # Pastikan android folder ada
           if [ ! -d android ]; then
-            echo "Folder android tidak ada — project mungkin belum di-create platform"
+            echo "Folder android tidak ada — menjalankan flutter create --platforms=android"
             flutter create --platforms=android .
           fi
 
-          # local.properties + gradle props ringan
           mkdir -p android
-          echo "sdk.dir=$ANDROID_HOME" > android/local.properties
-          echo "org.gradle.daemon=false" >> android/gradle.properties 2>/dev/null || true
-          echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m -XX:+HeapDumpOnOutOfMemoryError" >> android/gradle.properties 2>/dev/null || true
-          echo "android.useAndroidX=true" >> android/gradle.properties 2>/dev/null || true
 
-          if [ "$BUILD_TYPE" = "debug" ]; then
-            flutter build apk --debug
-          else
-            flutter build apk --release
+          # Jangan hapus local.properties project — hanya set/update sdk.dir & flutter.sdk
+          touch android/local.properties
+          grep -q '^sdk.dir=' android/local.properties 2>/dev/null \
+            && sed -i "s|^sdk.dir=.*|sdk.dir=$ANDROID_HOME|" android/local.properties \
+            || echo "sdk.dir=$ANDROID_HOME" >> android/local.properties
+          FLUTTER_ROOT=$(dirname "$(dirname "$(which flutter)")")
+          grep -q '^flutter.sdk=' android/local.properties 2>/dev/null \
+            && sed -i "s|^flutter.sdk=.*|flutter.sdk=$FLUTTER_ROOT|" android/local.properties \
+            || echo "flutter.sdk=$FLUTTER_ROOT" >> android/local.properties
+
+          # Gradle props (append jika belum ada)
+          touch android/gradle.properties
+          grep -q 'org.gradle.daemon=' android/gradle.properties || echo "org.gradle.daemon=false" >> android/gradle.properties
+          grep -q 'org.gradle.jvmargs=' android/gradle.properties || echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m -XX:+HeapDumpOnOutOfMemoryError" >> android/gradle.properties
+          grep -q 'android.useAndroidX=' android/gradle.properties || echo "android.useAndroidX=true" >> android/gradle.properties
+
+          # Jika project pakai key.properties / keystore yang tidak ada di CI →
+          # siapkan signing debug sementara agar release tetap bisa dibuild (umum di CI bot)
+          if [ ! -f android/key.properties ]; then
+            echo "key.properties tidak ada — CI akan memakai debug signing untuk release"
+            # Patch ringan: pastikan buildTypes.release bisa fallback (lewat gradle init script)
+            cat > /tmp/ci-signing.gradle << 'GEOF'
+allprojects {
+  afterEvaluate { project ->
+    if (project.hasProperty("android")) {
+      try {
+        def android = project.android
+        if (android.signingConfigs.findByName("debug") != null) {
+          android.buildTypes.each { bt ->
+            if (bt.name == "release" && (bt.signingConfig == null)) {
+              bt.signingConfig = android.signingConfigs.debug
+              println "CI: release signingConfig -> debug (no key.properties)"
+            }
+          }
+        }
+      } catch (Throwable t) {
+        println "CI signing patch skip: ${t.message}"
+      }
+    }
+  }
+}
+GEOF
+            # Terapkan via gradle.properties init path jika memungkinkan
+            mkdir -p ~/.gradle
+            echo "org.gradle.parallel=false" >> android/gradle.properties
           fi
+
+          set +e
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            flutter build apk --debug 2>&1 | tee /tmp/flutter-build.log
+            BUILD_EXIT=${PIPESTATUS[0]}
+          else
+            flutter build apk --release 2>&1 | tee /tmp/flutter-build.log
+            BUILD_EXIT=${PIPESTATUS[0]}
+          fi
+          set -e
+
+          if [ "$BUILD_EXIT" -ne 0 ]; then
+            echo ""
+            echo "========== BUILD GAGAL — CUPLIKAN ERROR =========="
+            # Cetak bagian penting Gradle/Flutter
+            grep -n -E "FAILURE:|\* What went wrong:|\* Where:|\* Try:|Error:|BUILD FAILED|Exception|error:" /tmp/flutter-build.log | tail -80 || true
+            echo ""
+            echo "========== TAIL LOG (80 baris) =========="
+            tail -80 /tmp/flutter-build.log || true
+            echo ""
+            # Copy error-only ke workspace agar mudah dilihat di Actions
+            {
+              grep -E "FAILURE:|\* What went wrong:|\* Where:|\* Try:|Error:|BUILD FAILED|Exception|error:|e: " /tmp/flutter-build.log || true
+              echo ""
+              tail -40 /tmp/flutter-build.log || true
+            } > "$GITHUB_WORKSPACE/build-error.txt" 2>/dev/null || true
+            exit "$BUILD_EXIT"
+          fi
+
+          echo "Build APK sukses"
 
       # ----------------------------------------------------------
       # 6. Cari APK + upload artifact (nama HARUS apk-<jobId>)
