@@ -1,0 +1,257 @@
+# ============================================================
+# Flutter ZIP → APK (GitHub Actions) — FIXED & READY
+# File: .github/workflows/flutter-build.yml
+#
+# Cocok dengan Tirzz / Web2Apk bot:
+# - inputs: jobId, userId, payload (JSON)
+# - payload berisi: appName, buildType, zipAssetId, zipAssetUrl,
+#                   zipRepo, zipReleaseTag
+# - Artifact name: apk-<jobId>  (bot akan cari nama ini)
+# ============================================================
+name: Flutter ZIP Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: 'Job ID from bot'
+        required: true
+        type: string
+      userId:
+        description: 'Telegram user ID'
+        required: true
+        type: string
+      payload:
+        description: 'JSON payload from bot'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # ----------------------------------------------------------
+      # 1. Minimal checkout (hanya biar runner punya workspace)
+      # ----------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # ----------------------------------------------------------
+      # 2. DOWNLOAD PROJECT ZIP (ini yang sebelumnya gagal)
+      #    Prioritas: Asset ID API → browser_download_url → gh CLI
+      # ----------------------------------------------------------
+      - name: Download project ZIP from GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Kalau repo PRIVATE dan GITHUB_TOKEN masih 404, ganti baris di atas jadi:
+          # GH_TOKEN: ${{ secrets.BUILD_PAT }}
+          # dan buat secret BUILD_PAT = PAT yang sama dengan worker.token di bot
+        run: |
+          set -euo pipefail
+          PAYLOAD='${{ inputs.payload }}'
+          echo "$PAYLOAD" > /tmp/payload.json
+          echo "=== Payload preview ==="
+          node -e "const p=JSON.parse(require('fs').readFileSync('/tmp/payload.json','utf8')); console.log(JSON.stringify({appName:p.appName,buildType:p.buildType,zipAssetId:p.zipAssetId,zipRepo:p.zipRepo,zipReleaseTag:p.zipReleaseTag,hasUrl:!!p.zipAssetUrl},null,2))"
+
+          ASSET_ID=$(node -e "const p=JSON.parse(require('fs').readFileSync('/tmp/payload.json','utf8')); console.log(p.zipAssetId||'')")
+          REPO=$(node -e "const p=JSON.parse(require('fs').readFileSync('/tmp/payload.json','utf8')); console.log(p.zipRepo||process.env.GITHUB_REPOSITORY)")
+          BROWSER_URL=$(node -e "const p=JSON.parse(require('fs').readFileSync('/tmp/payload.json','utf8')); console.log(p.zipAssetUrl||'')")
+          TAG=$(node -e "const p=JSON.parse(require('fs').readFileSync('/tmp/payload.json','utf8')); console.log(p.zipReleaseTag||'')")
+
+          echo "Repo=$REPO | AssetId=$ASSET_ID | Tag=$TAG"
+          echo "BrowserURL=${BROWSER_URL:0:80}..."
+
+          download_ok=0
+
+          # --- Cara 1: API asset id (paling reliable) ---
+          if [ -n "$ASSET_ID" ] && [ "$ASSET_ID" != "undefined" ] && [ "$ASSET_ID" != "null" ]; then
+            echo "→ Download via API asset id..."
+            if curl -fL --retry 3 --retry-delay 2 \
+              -H "Accept: application/octet-stream" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -o project.zip \
+              "https://api.github.com/repos/${REPO}/releases/assets/${ASSET_ID}"; then
+              download_ok=1
+            else
+              echo "API asset id gagal, coba cara berikutnya..."
+            fi
+          fi
+
+          # --- Cara 2: browser_download_url + auth header ---
+          if [ "$download_ok" -eq 0 ] && [ -n "$BROWSER_URL" ] && [ "$BROWSER_URL" != "undefined" ]; then
+            echo "→ Download via browser_download_url..."
+            if curl -fL --retry 3 --retry-delay 2 \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/octet-stream" \
+              -o project.zip \
+              "$BROWSER_URL"; then
+              download_ok=1
+            else
+              echo "browser_download_url gagal, coba cara berikutnya..."
+            fi
+          fi
+
+          # --- Cara 3: gh release download ---
+          if [ "$download_ok" -eq 0 ] && [ -n "$TAG" ] && [ "$TAG" != "undefined" ]; then
+            echo "→ Download via gh release download tag=$TAG..."
+            if gh release download "$TAG" --repo "$REPO" --pattern "*.zip" --dir .; then
+              FIRST_ZIP=$(ls -1 *.zip 2>/dev/null | head -1 || true)
+              if [ -n "$FIRST_ZIP" ] && [ "$FIRST_ZIP" != "project.zip" ]; then
+                mv "$FIRST_ZIP" project.zip
+              fi
+              if [ -f project.zip ]; then
+                download_ok=1
+              fi
+            fi
+          fi
+
+          if [ "$download_ok" -eq 0 ] || [ ! -f project.zip ]; then
+            echo "ERROR: Gagal download project ZIP"
+            echo "Payload:"
+            cat /tmp/payload.json
+            exit 1
+          fi
+
+          echo "=== File info ==="
+          ls -lh project.zip
+          file project.zip || true
+          # Pastikan file benar-benar ZIP (bukan JSON error dari API)
+          if ! unzip -t project.zip >/dev/null 2>&1; then
+            echo "ERROR: project.zip bukan file ZIP valid. Isi awal file:"
+            head -c 500 project.zip || true
+            exit 1
+          fi
+          echo "ZIP valid ✓"
+
+      # ----------------------------------------------------------
+      # 3. Extract + cari root Flutter (ada pubspec.yaml)
+      # ----------------------------------------------------------
+      - name: Extract project
+        run: |
+          set -euo pipefail
+          rm -rf project
+          mkdir -p project
+          unzip -q project.zip -d project
+
+          # Kalau ZIP berisi 1 folder di root, naikkan isinya
+          DIRS=$(find project -mindepth 1 -maxdepth 1 -type d | wc -l)
+          FILES=$(find project -mindepth 1 -maxdepth 1 -type f | wc -l)
+          if [ "$DIRS" -eq 1 ] && [ "$FILES" -eq 0 ]; then
+            INNER=$(find project -mindepth 1 -maxdepth 1 -type d | head -1)
+            echo "Flatten single root folder: $INNER"
+            shopt -s dotglob
+            mv "$INNER"/* project/ 2>/dev/null || true
+            rmdir "$INNER" 2>/dev/null || true
+            shopt -u dotglob
+          fi
+
+          # Cari pubspec.yaml (bisa nested)
+          PUBSPEC=$(find project -name pubspec.yaml -type f | head -1 || true)
+          if [ -z "$PUBSPEC" ]; then
+            echo "ERROR: pubspec.yaml tidak ditemukan"
+            find project -maxdepth 3 -type f | head -50
+            exit 1
+          fi
+
+          PROJECT_ROOT=$(dirname "$PUBSPEC")
+          echo "Flutter project root: $PROJECT_ROOT"
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> $GITHUB_ENV
+          ls -la "$PROJECT_ROOT"
+
+      # ----------------------------------------------------------
+      # 4. Java + Flutter
+      # ----------------------------------------------------------
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Flutter pub get
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          flutter pub get
+          # Beberapa project butuh generate
+          if [ -f "lib/main.dart" ] || [ -d "lib" ]; then
+            flutter pub run build_runner build --delete-conflicting-outputs 2>/dev/null || true
+          fi
+
+      # ----------------------------------------------------------
+      # 5. Build APK
+      # ----------------------------------------------------------
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          set -euo pipefail
+          BUILD_TYPE=$(node -e "const p=JSON.parse(require('fs').readFileSync('/tmp/payload.json','utf8')); console.log((p.buildType||'release').toLowerCase())")
+          echo "Build type = $BUILD_TYPE"
+
+          # Pastikan android folder ada
+          if [ ! -d android ]; then
+            echo "Folder android tidak ada — project mungkin belum di-create platform"
+            flutter create --platforms=android .
+          fi
+
+          # local.properties + gradle props ringan
+          mkdir -p android
+          echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+          echo "org.gradle.daemon=false" >> android/gradle.properties 2>/dev/null || true
+          echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m -XX:+HeapDumpOnOutOfMemoryError" >> android/gradle.properties 2>/dev/null || true
+          echo "android.useAndroidX=true" >> android/gradle.properties 2>/dev/null || true
+
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            flutter build apk --debug
+          else
+            flutter build apk --release
+          fi
+
+      # ----------------------------------------------------------
+      # 6. Cari APK + upload artifact (nama HARUS apk-<jobId>)
+      # ----------------------------------------------------------
+      - name: Locate APK
+        id: find_apk
+        run: |
+          set -euo pipefail
+          ROOT="${{ env.PROJECT_ROOT }}"
+          APK=$(find "$ROOT/build" -name "*.apk" -type f 2>/dev/null | head -1 || true)
+          if [ -z "$APK" ]; then
+            echo "ERROR: Tidak ada file .apk"
+            find "$ROOT" -name "*.apk" -type f 2>/dev/null || true
+            find "$ROOT/build" -type f 2>/dev/null | head -30 || true
+            exit 1
+          fi
+          echo "Found APK: $APK"
+          ls -lh "$APK"
+          echo "apk_path=$APK" >> $GITHUB_OUTPUT
+          # Copy ke path sederhana biar upload gampang
+          cp "$APK" ./app-release.apk
+          ls -lh ./app-release.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: app-release.apk
+          retention-days: 1
+          if-no-files-found: error
