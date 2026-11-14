@@ -1,6 +1,6 @@
 # ============================================================
 # Flutter ZIP → APK (GitHub Actions) — FIXED & READY
-# File: .github/workflows/flutter-build.yml
+# File: .github/workflows/build-flutter.yml
 #
 # Cocok dengan Tirzz / Web2Apk bot:
 # - inputs: jobId, userId, payload (JSON)
